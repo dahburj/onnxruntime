@@ -388,7 +388,9 @@ if (WIN32)
             " /wd6326 " # potential comparison of a constant with another constant
         )
     endif()
-
+    #By default, VC treat the source file as local code page(e.g. CP936) encoded,
+	#unless the file has a (wired) BOM at the beginning or this flag is set
+    string(APPEND CMAKE_CXX_FLAGS " /utf-8")
     # set compile warning level to 3 on CUDA build but 4 on CPU-only build
     if(onnxruntime_USE_CUDA)
         #CMake hardcoded /W3 in its 'Windows-NVIDIA-CUDA.cmake'. We'd better keep consistent with it.
