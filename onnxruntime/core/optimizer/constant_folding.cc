@@ -28,8 +28,9 @@ Status ConstantFolding::ApplyImpl(Graph& graph, bool& modified, int graph_level)
     // Check if constant folding can be applied on this node.
     if (!graph_utils::IsSupportedProvider(*node, GetCompatibleExecutionProviders()) ||
         excluded_op_types_.find(node->OpType()) != excluded_op_types_.end() ||
-        // constant folding is not currently supported for nodes that include subgraphs (control flow operators,
-        // such as If/Loop/Scan, fall into this category).
+        // constant folding does not support running a nodes that includes subgraphs (control flow operators,
+        // such as If/Loop/Scan, fall into this category). individual nodes in the subgraph will be processed
+        // by the Recurse call above
         node->ContainsSubgraph() ||
         // if the node output is in the graph output, we will get a graph with no nodes.
         // TODO check if this is allowed in ONNX and ORT.
@@ -74,6 +75,9 @@ Status ConstantFolding::ApplyImpl(Graph& graph, bool& modified, int graph_level)
 
     // Remove the output edges of the constant node and then remove the node itself.
     graph_utils::RemoveNodeOutputEdges(graph, *node);
+
+    // we can directly remove the node instead of using graph_utils::RemoveNode as all the node's outputs
+    // are now initializers
     graph.RemoveNode(node->Index());
 
     // The output nodes already have the right input arg, since we used the same name in the initializer.
@@ -83,6 +87,5 @@ Status ConstantFolding::ApplyImpl(Graph& graph, bool& modified, int graph_level)
   }
 
   return Status::OK();
-}  // namespace onnxruntime
-
+}
 }  // namespace onnxruntime
