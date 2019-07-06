@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #endif
 #include <onnxruntime/core/session/onnxruntime_c_api.h>
+void ReadFileAsString(const ORTCHAR_T* fname, void*& p, size_t& len);
 
 enum class OrtFileType { TYPE_BLK, TYPE_CHR, TYPE_DIR, TYPE_FIFO, TYPE_LNK, TYPE_REG, TYPE_SOCK, TYPE_UNKNOWN };
 using TCharString = std::basic_string<ORTCHAR_T>;
@@ -31,6 +32,15 @@ inline OrtFileType DTToFileType(DWORD dwFileAttributes) {
   }
   // TODO: test if it is reg
   return OrtFileType::TYPE_REG;
+}
+
+inline std::string FormatErrorCode(DWORD dw) {
+  char* lpMsgBuf;
+  FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, dw,
+                 MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&lpMsgBuf, 0, NULL);
+  std::string s(lpMsgBuf);
+  LocalFree(lpMsgBuf);
+  return s;
 }
 
 template <typename T>
@@ -75,7 +85,6 @@ inline void ReportSystemError(const char* operation_name, const TCharString& pat
   throw std::runtime_error(oss.str());
 }
 
-void ReadFileAsString(const ORTCHAR_T* fname, void*& p, size_t& len);
 
 inline OrtFileType DTToFileType(unsigned char t) {
   switch (t) {

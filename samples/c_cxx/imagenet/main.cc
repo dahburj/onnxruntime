@@ -15,60 +15,61 @@
 
 #include "providers.h"
 #include "local_filesystem.h"
-#include <glib.h>
+#include "sync_api.h"
 
 #include <onnxruntime/core/session/onnxruntime_c_api.h>
+
+#include <onnxruntime/core/providers/cpu/cpu_provider_factory.h>
 #include "image_loader.h"
-#include "AsyncRingBuffer.h"
+#include "async_ring_buffer.h"
 #include <fstream>
 #include <condition_variable>
 
-static std::vector<std::string> readFileToVec(const std::string& file_path, size_t expected_line_count) {
-  std::ifstream ifs(file_path);
-  if (!ifs) {
-    throw std::runtime_error("open file failed");
-  }
-  std::string line;
-  std::vector<std::string> labels;
-  while (std::getline(ifs, line)) {
-    if (!line.empty()) labels.push_back(line);
-  }
-  if (labels.size() != expected_line_count) {
-    std::ostringstream oss;
-    oss << "line count mismatch, expect " << expected_line_count << " from " << file_path << ", got " << labels.size();
-    throw std::runtime_error(oss.str());
-  }
-  return labels;
-}
 
-static int ExtractImageNumberFromFileName(const TCharString& image_file) {
-  size_t s = image_file.rfind('.');
-  if (s == std::string::npos) throw std::runtime_error("illegal filename");
-  size_t s2 = image_file.rfind('_');
-  if (s2 == std::string::npos) throw std::runtime_error("illegal filename");
 
-  const char* start_ptr = image_file.c_str() + s2 + 1;
-  const char* endptr = nullptr;
-  long value = strtol(start_ptr, (char**)&endptr, 10);
-  if (start_ptr == endptr || value > INT32_MAX || value <= 0) throw std::runtime_error("illegal filename");
-  return static_cast<int>(value);
-}
-
-static void verify_input_output_count(OrtSession* session) {
-  size_t count;
-  ORT_THROW_ON_ERROR(OrtSessionGetInputCount(session, &count));
-  assert(count == 1);
-  ORT_THROW_ON_ERROR(OrtSessionGetOutputCount(session, &count));
-  assert(count == 1);
-}
-
-void thread_pool_dispatcher(void* data, void* user_data) { (*(RunnableTask*)data)(); }
-
-class Validator : public OutputCollector {
+class Validator : public OutputCollector<TCharString> {
  private:
+  static std::vector<std::string> readFileToVec(const TCharString& file_path, size_t expected_line_count) {
+    std::ifstream ifs(file_path);
+    if (!ifs) {
+      throw std::runtime_error("open file failed");
+    }
+    std::string line;
+    std::vector<std::string> labels;
+    while (std::getline(ifs, line)) {
+      if (!line.empty()) labels.push_back(line);
+    }
+    if (labels.size() != expected_line_count) {
+      std::ostringstream oss;
+      oss << "line count mismatch, expect " << expected_line_count << " from " << file_path.c_str() << ", got "
+          << labels.size();
+      throw std::runtime_error(oss.str());
+    }
+    return labels;
+  }
+  static int ExtractImageNumberFromFileName(const TCharString& image_file) {
+    size_t s = image_file.rfind('.');
+    if (s == std::string::npos) throw std::runtime_error("illegal filename");
+    size_t s2 = image_file.rfind('_');
+    if (s2 == std::string::npos) throw std::runtime_error("illegal filename");
+
+    const ORTCHAR_T* start_ptr = image_file.c_str() + s2 + 1;
+    const ORTCHAR_T* endptr = nullptr;
+    long value = my_strtol(start_ptr, (ORTCHAR_T**)&endptr, 10);
+    if (start_ptr == endptr || value > INT32_MAX || value <= 0) throw std::runtime_error("illegal filename");
+    return static_cast<int>(value);
+  }
+
+  static void verify_input_output_count(OrtSession* session) {
+    size_t count;
+    ORT_THROW_ON_ERROR(OrtSessionGetInputCount(session, &count));
+    assert(count == 1);
+    ORT_THROW_ON_ERROR(OrtSessionGetOutputCount(session, &count));
+    assert(count == 1);
+  }
+
   OrtSession* session_ = nullptr;
   const int output_class_count_ = 1001;
-  std::vector<TCharString> image_file_paths_;
   std::vector<std::string> labels_;
   std::vector<std::string> validation_data_;
   std::atomic<int> top_1_correct_count_;
@@ -76,39 +77,31 @@ class Validator : public OutputCollector {
   int image_size_;
 
   std::mutex m_;
-  std::condition_variable cond_var_;
-  std::atomic<int> refcount_;
+  char* input_name_ = nullptr;
+  char* output_name_ = nullptr;
+  size_t input_image_count_;
 
  public:
   int GetImageSize() const { return image_size_; }
 
-  int IncRef() override { return refcount_.fetch_add(1); }
 
-  ~Validator() { OrtReleaseSession(session_); }
-
-  void FinishAndDecRef(const char* errmsg) override {
-    if (errmsg != nullptr) fprintf(stderr, "%s\n", errmsg);
-    if (--refcount_ == 0) {
-      cond_var_.notify_all();
-    }
+  ~Validator() {
+    free(input_name_);
+    free(output_name_);
+    OrtReleaseSession(session_);
   }
 
-  void Wait() {
-    {
-      std::unique_lock<std::mutex> l(m_);
-      while (refcount_ != 0) cond_var_.wait(l);
-    }
-    printf("Top-1 Accuracy %f\n", ((float)top_1_correct_count_.load() / image_file_paths_.size()));
+  void PrintResult() {
+    printf("Top-1 Accuracy %f\n", ((float)top_1_correct_count_.load() / input_image_count_));
   }
 
-  Validator(OrtEnv* env, const std::vector<TCharString>& image_file_paths, const TCharString& model_path,
-            const TCharString& label_file_path, const TCharString& validation_file_path)
-      : image_file_paths_(image_file_paths),
-        labels_(readFileToVec(label_file_path, 1000)),
-        validation_data_(readFileToVec(validation_file_path, image_file_paths_.size())),
+  Validator(OrtEnv* env, const TCharString& model_path, const TCharString& label_file_path,
+            const TCharString& validation_file_path, size_t input_image_count)
+      : labels_(readFileToVec(label_file_path, 1000)),
+        validation_data_(readFileToVec(validation_file_path, input_image_count)),
         top_1_correct_count_(0),
         finished_count_(0),
-        refcount_(1) {
+        input_image_count_(input_image_count) {
     OrtSessionOptions* session_option;
     ORT_THROW_ON_ERROR(OrtCreateSessionOptions(&session_option));
 #ifdef USE_CUDA
@@ -117,7 +110,19 @@ class Validator : public OutputCollector {
     ORT_THROW_ON_ERROR(OrtCreateSession(env, model_path.c_str(), session_option, &session_));
     OrtReleaseSessionOptions(session_option);
     verify_input_output_count(session_);
+    OrtAllocator* ort_alloc;
+    ORT_THROW_ON_ERROR(OrtCreateDefaultAllocator(&ort_alloc));
+    {
+      char* t;
+      ORT_THROW_ON_ERROR(OrtSessionGetInputName(session_, 0, ort_alloc, &t));
+      input_name_ = my_strdup(t);
+      OrtAllocatorFree(ort_alloc, t);
+      ORT_THROW_ON_ERROR(OrtSessionGetOutputName(session_, 0, ort_alloc, &t));
+      output_name_ = my_strdup(t);
+      OrtAllocatorFree(ort_alloc, t);
+    }
 
+    OrtReleaseAllocator(ort_alloc);
     OrtTypeInfo* info;
     ORT_THROW_ON_ERROR(OrtSessionGetInputTypeInfo(session_, 0, &info));
     const OrtTensorTypeAndShapeInfo* tensor_info;
@@ -134,38 +139,33 @@ class Validator : public OutputCollector {
     image_size_ = static_cast<int>(dims[1]);
   }
 
-  void operator()(const std::vector<int>& task_id_list, const OrtValue* input_tensor) override {
-    const size_t remain = task_id_list.size();
-    const char* input_name = "input:0";
-    const char* output_name = "InceptionV4/Logits/Predictions:0";
-    OrtValue* output_tensor = nullptr;
-    ORT_THROW_ON_ERROR(OrtRun(session_, nullptr, &input_name, &input_tensor, 1, &output_name, 1, &output_tensor));
-    float* probs;
-    ORT_THROW_ON_ERROR(OrtGetTensorMutableData(output_tensor, (void**)&probs));
-    for (size_t i = 0; i != remain; ++i) {
-      float* end = probs + output_class_count_;
-      float* max_p = std::max_element(probs + 1, end);
-      auto max_prob_index = std::distance(probs, max_p);
-      assert(max_prob_index >= 1);
-      // TODO:extract number from filename, to index validation_data
-      int taskid = task_id_list[i];
-      const auto& s = image_file_paths_[taskid];
-      int test_data_id = ExtractImageNumberFromFileName(s);
-      assert(test_data_id > 1);
-      // printf("%d\n",(int)max_prob_index);
-      // printf("%s\n",labels[max_prob_index - 1].c_str());
-      // printf("%s\n",validation_data[test_data_id - 1].c_str());
-      if (labels_[max_prob_index - 1] == validation_data_[test_data_id - 1]) {
-        ++top_1_correct_count_;
+  void operator()(const std::vector<TCharString>& task_id_list, const OrtValue* input_tensor) override {
+    {
+      std::lock_guard<std::mutex> l(m_);
+      const size_t remain = task_id_list.size();
+      OrtValue* output_tensor = nullptr;
+      ORT_THROW_ON_ERROR(OrtRun(session_, nullptr, &input_name_, &input_tensor, 1, &output_name_, 1, &output_tensor));
+      float* probs;
+      ORT_THROW_ON_ERROR(OrtGetTensorMutableData(output_tensor, (void**)&probs));
+      for (const auto& s : task_id_list) {
+        float* end = probs + output_class_count_;
+        float* max_p = std::max_element(probs + 1, end);
+        auto max_prob_index = std::distance(probs, max_p);
+        assert(max_prob_index >= 1);
+        int test_data_id = ExtractImageNumberFromFileName(s);
+        assert(test_data_id >= 1);
+        // printf("%d\n",(int)max_prob_index);
+        // printf("%s\n",labels[max_prob_index - 1].c_str());
+        // printf("%s\n",validation_data[test_data_id - 1].c_str());
+        if (labels_[max_prob_index - 1] == validation_data_[test_data_id - 1]) {
+          ++top_1_correct_count_;
+        }
+        probs = end;
       }
-      probs = end;
-    }
-    finished_count_ += remain;
-    printf("%d\n", finished_count_.load());
-    OrtReleaseValue(output_tensor);
-    if (--refcount_ == 0) {
-      cond_var_.notify_all();
-    }
+      finished_count_ += remain;
+      printf("%d\n", finished_count_.load());
+      OrtReleaseValue(output_tensor);
+    }    
   }
 };
 
@@ -177,17 +177,17 @@ int real_main(int argc, ORTCHAR_T* argv[]) {
   // imagenet_lsvrc_2015_synsets.txt
   TCharString label_file_path = argv[3];
   TCharString validation_file_path = argv[4];
-  const int batch_size = 64;
+  const int batch_size = 32;
 
   // TODO: remove the slash at the end of data_dir string
   LoopDir(data_dir, [&data_dir, &image_file_paths](const ORTCHAR_T* filename, OrtFileType filetype) -> bool {
     if (filetype != OrtFileType::TYPE_REG) return true;
     if (filename[0] == '.') return true;
-    const char* p = strrchr(filename, '.');
+    const ORTCHAR_T* p = my_strrchr(filename, '.');
     if (p == nullptr) return true;
     // as we tested filename[0] is not '.', p should larger than filename
     assert(p > filename);
-    if (strcasecmp(p, ".JPEG") != 0 && strcasecmp(p, ".JPG") != 0) return true;
+    if (my_strcasecmp(p, ORT_TSTR(".JPEG")) != 0 && my_strcasecmp(p, ORT_TSTR(".JPG")) != 0) return true;
     TCharString v(data_dir);
 #ifdef _WIN32
     v.append(1, '\\');
@@ -202,31 +202,27 @@ int real_main(int argc, ORTCHAR_T* argv[]) {
   std::vector<uint8_t> data;
   Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "Default");
 
-  GError* err = NULL;
-  GThreadPool* threadpool = g_thread_pool_new(thread_pool_dispatcher, nullptr, 8, TRUE, &err);
-  if (err != NULL) {
-    fprintf(stderr, "Unable to create thread pool: %s\n", err->message);
-    g_error_free(err);
-    return -1;
-  }
-  assert(threadpool != nullptr);
-
-  Validator v(env, image_file_paths, model_path, label_file_path, validation_file_path);
+  Validator v(env, model_path, label_file_path, validation_file_path, image_file_paths.size());
 
   int image_size = v.GetImageSize();
   const int channels = 3;
   std::atomic<int> finished(0);
 
   InceptionPreprocessing prepro(image_size, image_size, channels);
-
-  AsyncRingBuffer buffer(batch_size, 160, threadpool, image_file_paths, &prepro, &v);
+  Controller c;
+  AsyncRingBuffer<std::vector<TCharString>::iterator> buffer(batch_size, 160, c, image_file_paths.begin(),
+                                                             image_file_paths.end(), &prepro, &v);
   buffer.StartDownloadTasks();
-  v.Wait();
+  c.Wait();
+  v.PrintResult();
 
   return 0;
 }
-
+#ifdef _WIN32
+int wmain(int argc, ORTCHAR_T* argv[]) {
+#else
 int main(int argc, ORTCHAR_T* argv[]) {
+#endif
   try {
     return real_main(argc, argv);
   } catch (const std::exception& ex) {

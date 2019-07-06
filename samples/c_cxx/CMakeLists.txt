@@ -12,19 +12,24 @@ else()
  string(APPEND CMAKE_C_FLAGS " -Wall -Wextra")
 endif()
 
+message("${CMAKE_SYSTEM_INCLUDE_PATH}")
 find_package(JPEG REQUIRED)
-find_package(PNG REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_search_module(GLIB REQUIRED glib-2.0)
+find_package(PNG)
+
 
 add_definitions(-DUSE_CUDA)
 
 #TODO: remove this part(need to talk to Ryan and find a solution for this)
 if(UNIX)
  include_directories("/usr/local/include/onnxruntime")
+else()
+ include_directories("C:\\Program Files (x86)\\onnxruntime\\include" "C:\\Program Files (x86)\\onnxruntime\\include\\onnxruntime")
+ link_directories("C:\\Program Files (x86)\\onnxruntime\\lib")
 endif()
 
 
 add_subdirectory(imagenet)
-add_subdirectory(fns_candy_style_transfer)
+if(PNG_FOUND)
+  add_subdirectory(fns_candy_style_transfer)
+endif()
 

@@ -1,6 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
-
+#include <algorithm>
 #include "image_loader.h"
 #include "CachedInterpolation.h"
 #include <jpeglib.h>
@@ -150,7 +150,7 @@ void InceptionPreprocessing::operator()(const void* input_data, void* output_dat
 
   if (decompressed_image == nullptr) {
     std::ostringstream oss;
-    oss << "decompress '" << file_name << "' failed";
+    oss << "decompress '" << file_name.c_str() << "' failed";
     throw std::runtime_error(oss.str());
   }
 
@@ -176,6 +176,6 @@ void InceptionPreprocessing::operator()(const void* input_data, void* output_dat
   ResizeImageInMemory(float_file_data.data(), output_data_, height, width, out_height_, out_width_, channels);
   size_t output_data_len = channels_ * out_height_ * out_width_;
   for (size_t i = 0; i != output_data_len; ++i) {
-    output_data_[i] = (output_data_[i] - 0.5) * 2;
+    output_data_[i] = (output_data_[i] - 0.5f) * 2.f;
   }
 }

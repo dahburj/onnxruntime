@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include "CachedInterpolation.h"
+#include "sync_api.h"
 #include <onnxruntime/core/session/onnxruntime_c_api.h>
 
 template <typename T>
@@ -38,11 +39,10 @@ class DataProcessing {
   virtual std::vector<int64_t> GetOutputShape(size_t batch_size) = 0;
 };
 
+template <typename InputType>
 class OutputCollector {
  public:
-  virtual void operator()(const std::vector<int>& task_id_list, const OrtValue* tensor) = 0;
-  virtual int IncRef() = 0;
-  virtual void FinishAndDecRef(const char* errmsg) = 0;
+  virtual void operator()(const std::vector<InputType>& task_id_list, const OrtValue* tensor) = 0;
 };
 
 class InceptionPreprocessing : public DataProcessing {
