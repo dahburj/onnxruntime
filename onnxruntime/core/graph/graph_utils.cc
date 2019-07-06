@@ -54,31 +54,34 @@ static bool OutputEdgeProvidesImplicitInput(const Graph& graph, const GraphEdge&
 
 /** Checks if new_output_name can be used to replace removed_output_name in the subgraph input.
     If there is an existing NodeArg in a subgraph that implicitly consumes removed_output_name, it is not safe. */
-static bool CanUpdateImplicitInputNameInSubgraph(Node& node,
+static bool CanUpdateImplicitInputNameInSubgraph(const Node& node,
                                                  const std::string& removed_output_name,
                                                  const std::string& new_output_name) {
-  for (auto& attr_subgraph_pair : node.GetAttributeNameToMutableSubgraphMap()) {
-    Graph& subgraph = *attr_subgraph_pair.second;
-    // if we have an existing NodeArg in the subgraph with the new_output_name that would override an implicit input
-    // with the same name
-    if (subgraph.GetNodeArg(new_output_name) != nullptr) {
-      return false;
-    }
+  for (const auto attr : node.GetAttributes()) {
+    if (attr.second.has_g()) {
+      const Graph& subgraph = *node.GetGraphAttribute(attr.first);
 
-    for (auto& subgraph_node : attr_subgraph_pair.second->Nodes()) {
-      // recurse if this node also consumes removed_output_name as an implicit input (i.e. there are multiple levels of nested
-      // subgraphs, and at least one level lower uses removed_output_name as an implicit input
-      const auto subgraph_node_implicit_inputs = subgraph_node.ImplicitInputDefs();
-      if (!subgraph_node_implicit_inputs.empty()) {
-        auto subgraph_node_also_consumes_nodearg_as_implicit_input =
-            std::find_if(subgraph_node_implicit_inputs.cbegin(), subgraph_node_implicit_inputs.cend(),
-                         [&removed_output_name](const NodeArg* input) {
-                           return input != nullptr && input->Name() == removed_output_name;
-                         });
+      // if we have an existing NodeArg in the subgraph with the new_output_name that would override an implicit input
+      // with the same name
+      if (subgraph.GetNodeArg(new_output_name) != nullptr) {
+        return false;
+      }
 
-        if (subgraph_node_also_consumes_nodearg_as_implicit_input != subgraph_node_implicit_inputs.cend()) {
-          if (!CanUpdateImplicitInputNameInSubgraph(subgraph_node, removed_output_name, new_output_name))
-            return false;
+      for (auto& subgraph_node : subgraph.Nodes()) {
+        // recurse if this node also consumes removed_output_name as an implicit input (i.e. there are multiple levels of nested
+        // subgraphs, and at least one level lower uses removed_output_name as an implicit input
+        const auto subgraph_node_implicit_inputs = subgraph_node.ImplicitInputDefs();
+        if (!subgraph_node_implicit_inputs.empty()) {
+          auto subgraph_node_also_consumes_nodearg_as_implicit_input =
+              std::find_if(subgraph_node_implicit_inputs.cbegin(), subgraph_node_implicit_inputs.cend(),
+                           [&removed_output_name](const NodeArg* input) {
+                             return input != nullptr && input->Name() == removed_output_name;
+                           });
+
+          if (subgraph_node_also_consumes_nodearg_as_implicit_input != subgraph_node_implicit_inputs.cend()) {
+            if (!CanUpdateImplicitInputNameInSubgraph(subgraph_node, removed_output_name, new_output_name))
+              return false;
+          }
         }
       }
     }
@@ -159,19 +162,20 @@ static void RemoveGraphEdges(Graph& graph, const std::vector<GraphEdge>& edges) 
 /** Given a graph, a list of edges, and a NodeArg name, checks if each of the edges provides an implicit input
     to a subgraph. If so, it checks if there is no clash of the given NodeArg name in each of the subgraphs. 
     This is important when removing a node with this NodeArg as input. */
-bool CanUpdateImplicitInputNameInSubgraphs(Graph& graph,
+bool CanUpdateImplicitInputNameInSubgraphs(const Graph& graph,
                                            const std::vector<GraphEdge>& output_edges,
                                            const std::string& new_arg_name) {
   for (const auto& output_edge : output_edges) {
     if (OutputEdgeProvidesImplicitInput(graph, output_edge)) {
-      Node& mutable_output_edge_node = *graph.GetNode(output_edge.dst_node);
-      if (!CanUpdateImplicitInputNameInSubgraph(mutable_output_edge_node, output_edge.arg_name, new_arg_name)) {
+      const Node& output_edge_node = *graph.GetNode(output_edge.dst_node);
+      if (!CanUpdateImplicitInputNameInSubgraph(output_edge_node, output_edge.arg_name, new_arg_name)) {
         LOGS_DEFAULT(WARNING) << " Implicit input name " << output_edge.arg_name
                               << " cannot be safely updated to " << new_arg_name << " in one of the subgraphs.";
         return false;
       }
     }
   }
+
   return true;
 }
 
@@ -368,22 +372,20 @@ bool IsOutputUsed(const Node& node, int index) {
 }
 
 bool CanRemoveNode(const Graph& graph, const Node& node, const std::string* replacement_for_node_output) {
-  // if the replacement has the same name (e.g. fusing nodes and using output name of last node in fusion
-  // we can remove a node that was providing graph output.
-  // this assumes IsOnlyOneOutputUsed is called first s.
-  auto replacing_with_output_of_same_name = [](const Node& node, const std::string* name) {
-    // get the output definition index from the first edge.
-    // we know all edges use the same output as IsOnlyOneOutputUsed was called previously
-    auto used_output_index = node.OutputEdgesBegin()->GetSrcArgIndex();
-    return name && node.OutputDefs()[used_output_index]->Name() == *name;
-  };
+  // we have no way to handle replacing multiple outputs
+  if (!IsOnlyOneOutputUsed(node)) {
+    return false;
+  }
 
   // Cannot remove a node whose output is a graph output,
-  // or with more than one of its outputs as input to downstream Operators.
-  if (!IsOnlyOneOutputUsed(node) ||
-      (graph.IsNodeOutputsInGraphOutputs(node) &&
-       !replacing_with_output_of_same_name(node, replacement_for_node_output))) {
-    return false;
+  // unless something else is creating an output with the same name
+  if (graph.IsNodeOutputsInGraphOutputs(node)) {
+    if (!replacement_for_node_output)
+      return false;
+
+    auto used_output_index = node.OutputEdgesBegin()->GetSrcArgIndex();
+    if (node.OutputDefs()[used_output_index]->Name() != *replacement_for_node_output)
+      return false;
   }
 
   bool can_remove = false;
@@ -405,17 +407,18 @@ bool CanRemoveNode(const Graph& graph, const Node& node, const std::string* repl
   }
 
   if (new_name) {
-    // Check that the incoming NodeArg can be safely used in the presence of subgraphs.
+    // Check that the new NodeArg can be safely used in the presence of subgraphs.
     std::vector<GraphEdge> output_edges = GetNodeOutputEdges(node);
     can_remove = CanUpdateImplicitInputNameInSubgraphs(graph, output_edges, *new_name);
   }
 
   return can_remove;
-}  // namespace graph_utils
+}
 
 bool RemoveNodeAndUpdateEdges(Graph& graph, Node& node, NodeArg* replacement_output) {
-  if (!CanRemoveNode(graph, node, replacement_output ? &replacement_output->Name() : nullptr))
+  if (!CanRemoveNode(graph, node, replacement_output ? &replacement_output->Name() : nullptr)) {
     return false;
+  }
 
   // explicit value
   if (replacement_output) {
@@ -473,8 +476,8 @@ bool NodeArgIsConstant(const Graph& graph, const NodeArg& node_arg) {
 }
 
 bool AllNodeInputsAreConstant(const Graph& graph, const Node& node, InitializedTensorSet& constant_inputs) {
-  // only initializers can be constant, and there's no edge from a node to an initializer
-  // so the input edges count must be 0
+  // only initializers can be constant. There's no edge from a node to an initializer
+  // so the input edges count will be 0 if all the inputs are initializers.
   if (node.GetInputEdgesCount() > 0) {
     return false;
   }
@@ -495,27 +498,12 @@ bool AllNodeInputsAreConstant(const Graph& graph, const Node& node, InitializedT
   return true;
 }
 
-//bool ReplaceInitializer(Graph& graph, const std::string& original_name, ONNX_NAMESPACE::TensorProto& initializer,
-//                        bool check_outer_scope) {
-//  bool replaced = false;
-//  const ONNX_NAMESPACE::TensorProto* old_initializer = nullptr;
-//  if (graph.GetInitializedTensor(original_name, old_initializer)) {
-//    // TODO: Be conservative and only remove if the name matches. Graph::CleanupUnusedInitializers can take care
-//    // of removing anything unused after optimization
-//    if (original_name == initializer.name()) {
-//      graph.RemoveInitializedTensor(original_name);
-//    }
-//    graph.AddInitializedTensor(initializer);
-//    replaced = true;
-//
-//  } else if (check_outer_scope && graph.IsSubgraph()) {
-//    replaced = ReplaceInitializer(*graph.MutableParentGraph(), original_name, initializer, check_outer_scope);
-//  }
-//
-//  return replaced;
-//}
-
 NodeArg& AddReplacementInitializer(Graph& graph, ONNX_NAMESPACE::TensorProto& new_initializer) {
+  // sanity check as AddInitializedTensor silently ignores attempts to add a duplicate initializer
+  const ONNX_NAMESPACE::TensorProto* existing = nullptr;
+  ORT_ENFORCE(!graph.GetInitializedTensor(new_initializer.name(), existing),
+              "Initializer with same name exists. Name:", new_initializer.name());
+
   graph.AddInitializedTensor(new_initializer);
 
   ONNX_NAMESPACE::TypeProto new_type;
@@ -534,6 +522,39 @@ size_t RemoveNodeOutputEdges(Graph& graph, Node& node) {
   RemoveGraphEdges(graph, output_edges);
 
   return output_edges.size();
+}
+
+void DisconnectNodes(Graph& graph, const Node& first_node, const Node& second_node, int output_idx) {
+  auto idx1 = first_node.Index();
+  auto idx2 = second_node.Index();
+
+  int input_idx = -1;
+  for (auto edge = first_node.OutputEdgesBegin(), end = first_node.OutputEdgesEnd(); edge != end; ++edge) {
+    if (&edge->GetNode() == &second_node) {
+      input_idx = edge->GetDstArgIndex();
+    }
+  }
+
+  ORT_ENFORCE(input_idx >= 0, "Failed to find edge between nodes.");
+
+  graph.RemoveEdge(idx1, idx2, output_idx, input_idx);
+}
+
+void MoveOutput(Graph& graph, Node& src_node, Node& target_node, bool move_definition) {
+  if (move_definition) {
+    assert(src_node.OutputDefs().size() == 1);
+    assert(target_node.OutputDefs().size() == 1);
+    target_node.MutableOutputDefs()[0] = src_node.MutableOutputDefs()[0];
+  }
+
+  auto src_idx = src_node.Index();
+  auto target_idx = target_node.Index();
+  auto output_edges = GetNodeOutputEdges(src_node);
+
+  for (auto cur = output_edges.cbegin(), end = output_edges.cend(); cur != end; ++cur) {
+    graph.AddEdge(target_idx, cur->dst_node, 0, cur->dst_arg_index);
+    graph.RemoveEdge(src_idx, cur->dst_node, 0, cur->dst_arg_index);
+  }
 }
 
 }  // namespace graph_utils
